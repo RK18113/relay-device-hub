@@ -97,3 +97,15 @@ test('the frontend loads when installed beneath a hidden home directory', async 
   assert.match(await response.text(), /Relay shell/);
   assert.equal(response.headers.get('cache-control'), 'public, max-age=0');
 });
+
+
+test('CPU and GPU temperature readings and sensor labels survive ingestion', async t => {
+  const { request, rows } = await fixture(t);
+  const body = { ...sample, temperatureC: 72.5, temperatureSource: 'k10temp · Tctl',
+    gpu: { name: 'GPU', state: 'P0', mode: 'nvidia', temperatureC: 64, temperatureSource: 'GPU core' } };
+  const post = value => request('/api/ingest', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer first-agent-key' }, body: JSON.stringify(value) });
+  assert.equal((await post({ ...body, temperatureC: 999 })).status, 400);
+  assert.equal((await post(body)).status, 202);
+  assert.equal(rows[0].temperatureC, 72.5); assert.equal(rows[0].temperatureSource, 'k10temp · Tctl');
+  assert.equal(rows[0].gpu.temperatureC, 64);
+});

@@ -4,6 +4,7 @@ import argparse
 import csv
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -28,6 +29,55 @@ def number(value):
         return float(value)
     except (ValueError, TypeError):
         return None
+
+
+def sensor_celsius(path):
+    value = number(text(path))
+    if value is None or not math.isfinite(value) or not -30000 <= value <= 150000:
+        return None
+    return round(value / 1000, 1)
+
+
+def cpu_temperature(hwmon_root=Path('/sys/class/hwmon'), thermal_root=Path('/sys/class/thermal')):
+    """Prefer CPU package/die sensors, never motherboard or disk sensors."""
+    candidates = []
+    for monitor in hwmon_root.glob('hwmon*'):
+        driver = text(monitor / 'name')
+        if driver not in ('coretemp', 'k10temp', 'zenpower'):
+            continue
+        for source in monitor.glob('temp*_input'):
+            value = sensor_celsius(source)
+            if value is None:
+                continue
+            label = text(source.with_name(source.name.replace('_input', '_label')), source.stem)
+            lower = label.lower()
+            rank = 0 if lower.startswith('package') or lower == 'tdie' else 1 if lower == 'tctl' else 2
+            candidates.append((rank, value, f'{driver} · {label}'))
+    if candidates:
+        priority = min(item[0] for item in candidates)
+        _, value, source = max((item for item in candidates if item[0] == priority), key=lambda item: item[1])
+        return value, source
+    for zone in thermal_root.glob('thermal_zone*'):
+        kind = text(zone / 'type')
+        if kind in ('x86_pkg_temp', 'k10temp', 'cpu-thermal', 'cpu_thermal'):
+            value = sensor_celsius(zone / 'temp')
+            if value is not None:
+                return value, kind
+    return None, None
+
+
+def passive_gpu_temperature(pci):
+    """Do not touch GPU temperature files unless it is already active."""
+    pci = Path(pci)
+    if text(pci / 'power_state') != 'D0' or text(pci / 'power/runtime_status') != 'active':
+        return None, None
+    for monitor in (pci / 'hwmon').glob('hwmon*'):
+        for source in sorted(monitor.glob('temp*_input')):
+            value = sensor_celsius(source)
+            if value is not None:
+                label = text(source.with_name(source.name.replace('_input', '_label')), source.stem)
+                return value, f'{text(monitor / "name", "GPU")} · {label}'
+    return None, None
 
 
 class Sampler:
@@ -67,7 +117,7 @@ class Sampler:
 
     def gpu(self, now):
         if self.config.get('nvidia_monitor'):
-            if now - self.gpu_sampled < 60:
+            if now - self.gpu_sampled < max(15, min(300, int(self.config.get('interval_seconds', 30)))):
                 return self.gpu_cache
             self.gpu_sampled = now
             try:
@@ -76,14 +126,18 @@ class Sampler:
                 row = next(csv.reader(raw.splitlines(), skipinitialspace=True))
                 self.gpu_cache = {'name': row[0], 'state': row[1], 'utilization': number(row[2]), 'temperatureC': number(row[3]),
                                   'powerW': number(row[4]), 'powerLimitW': number(row[5]), 'memoryUsedMb': number(row[6]),
-                                  'memoryTotalMb': number(row[7]), 'mode': 'nvidia', 'sampledAt': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+                                  'memoryTotalMb': number(row[7]), 'mode': 'nvidia', 'temperatureSource': 'NVIDIA GPU core',
+                                  'sampledAt': datetime.datetime.now(datetime.timezone.utc).isoformat()}
             except (OSError, subprocess.SubprocessError, StopIteration, IndexError):
                 self.gpu_cache = {'name': self.config.get('gpu_name', 'NVIDIA'), 'state': 'unavailable', 'mode': 'nvidia'}
             return self.gpu_cache
         pci = self.config.get('gpu_pci_path')
         if pci:
+            temperature, source = passive_gpu_temperature(pci)
             return {'name': self.config.get('gpu_name', 'Discrete GPU'), 'state': text(Path(pci) / 'power_state', 'unavailable'),
                     'runtimeStatus': text(Path(pci) / 'power/runtime_status', 'unknown'),
+                    'temperatureC': temperature, 'temperatureSource': source,
+                    'sampledAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     'mode': 'intel' if text('/etc/prime-discrete') == 'off' else 'hybrid',
                     'driverLoaded': Path('/sys/module/nvidia').exists()}
         return None
@@ -139,13 +193,7 @@ class Sampler:
         rates = [max(0, (net[i] - self.previous_net[i]) / elapsed) for i in range(2)] if elapsed and self.previous_net else [0, 0]
         self.previous_net, self.previous_time = net, now
         disk = shutil.disk_usage(self.config.get('disk_path', '/'))
-        temp = None
-        for zone in Path('/sys/class/thermal').glob('thermal_zone*'):
-            if text(zone / 'type') in ('x86_pkg_temp', 'k10temp'):
-                value = number(text(zone / 'temp'))
-                if value is not None:
-                    temp = value / 1000
-                    break
+        temp, temp_source = cpu_temperature()
         try:
             profile = subprocess.check_output(['powerprofilesctl', 'get'], text=True, timeout=2).strip()
         except (OSError, subprocess.SubprocessError):
@@ -153,7 +201,8 @@ class Sampler:
         uptime = number(text('/proc/uptime').split(' ')[0]) or 0
         return {'deviceId': self.config['device_id'], 'sampledAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 'hostname': os.uname().nodename, 'os': self.os_name, 'cpuName': self.cpu_name, 'cpuCores': os.cpu_count() or 1,
-                'cpuPercent': round(percent, 1), 'temperatureC': temp, 'memoryTotalBytes': total_mem, 'memoryUsedBytes': used_mem,
+                'cpuPercent': round(percent, 1), 'temperatureC': temp, 'temperatureSource': temp_source,
+                'memoryTotalBytes': total_mem, 'memoryUsedBytes': used_mem,
                 'diskTotalBytes': disk.total, 'diskUsedBytes': disk.used, 'diskFreeBytes': disk.free,
                 'uptimeSeconds': uptime, 'powerProfile': profile, 'battery': self.battery(), 'gpu': self.gpu(now),
                 'network': {'rxBytesPerSecond': round(rates[0]), 'txBytesPerSecond': round(rates[1])},

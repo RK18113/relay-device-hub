@@ -8,12 +8,17 @@ Relay is a reusable application. Device names, addresses, ownership and keys are
 
 *Preview with synthetic devices and readings.*
 
+![CPU and GPU temperature history](docs/temperatures.png)
+
+*Temperature view with synthetic training readings.*
+
 The interface uses a minimal charcoal theme with a lavender accent. The **Tailscale** button opens the network dashboard in a separate tab.
 
 ## What it does
 
 - Reports device availability, CPU, memory, storage, uptime, network rates, power profile and battery capacity/condition.
-- Optional NVIDIA monitoring on desktops; laptop monitoring reads PCI power state without invoking NVIDIA tools.
+- CPU and GPU temperatures on device cards and per-device history charts, including observed low/peak values for the recent hour. Intel package and AMD hwmon sensors are detected automatically, with the source label shown. AMD Tctl is displayed as reported; it is not relabeled as a die sensor.
+- Optional NVIDIA monitoring on desktops follows the reporting interval (30 seconds by default). Laptop monitoring reads PCI power state without invoking NVIDIA tools; passive GPU temperatures are read only when that GPU is already active. A powered-down GPU has no current temperature reading.
 - Shows up to 250 processes per device, with search and CPU/memory sorting. Process names are collected; command arguments are excluded.
 - Keeps 48 hours of metric history in MongoDB; process lists are overwritten by the latest report.
 - Browses and downloads files through the host or Tailscale SSH. There are no upload, deletion, terminal or process-control endpoints.
@@ -99,6 +104,8 @@ npm test
 npm run build
 ```
 
-Tests cover owner authentication, per-device ingestion keys, enrollment isolation, request validation, stale/offline behavior, SSH destination validation, traversal, hidden files, symbolic links, special files and exact download bytes. API tests open loopback sockets.
+Temperature graphs preserve missing readings and reporting gaps. Metric history is retained for approximately 48 hours; charts display the recent hour. CPU readings from before the sensor update may be unavailable; no values are invented or backfilled. There are no universal danger thresholds or automatic throttling controls.
+
+Tests cover Intel/AMD sensor selection, sleeping-GPU safety, missing temperature data, owner authentication, per-device ingestion keys, enrollment isolation, request validation, stale/offline behavior, SSH destination validation, traversal, hidden files, symbolic links, special files and exact download bytes. API tests open loopback sockets.
 
 For a local UI preview, configure a test workspace/database, load its environment, and run the server with `NODE_ENV=development HUB_LOCAL_PREVIEW=1` on loopback. This intentionally bypasses owner authentication for development; never expose it remotely. `npm run dev` serves Vite UI development with the API proxy pointing at port 4310. Set `HUB_API_URL=http://127.0.0.1:OTHER_PORT` when the development API uses a different port.
