@@ -109,3 +109,61 @@ test('CPU and GPU temperature readings and sensor labels survive ingestion', asy
   assert.equal(rows[0].temperatureC, 72.5); assert.equal(rows[0].temperatureSource, 'k10temp · Tctl');
   assert.equal(rows[0].gpu.temperatureC, 64);
 });
+
+const actionHeaders = { ...headers, 'Content-Type': 'application/json', Origin: 'https://hub.example.test' };
+function mockControls() {
+  const calls = [];
+  return { calls, controlTransport: async (_device, request) => {
+    calls.push(request);
+    if (request.operation === 'capabilities') return { capabilities: { reboot: { available: true }, lock: { available: true }, poweroff: { available: true } } };
+    if (request.operation === 'execute') return { jobId: 'a'.repeat(32), status: 'scheduled' };
+    return { status: 'requested', message: 'Accepted' };
+  } };
+}
+test('device actions require owner, same origin, fresh device and one-use matching confirmation', async t => {
+  const mock = mockControls(), { request, rows } = await fixture(t, mock);
+  const post = (endpoint, body, h = actionHeaders) => request('/api/devices/test-desktop/actions' + endpoint, { method: 'POST', headers: h, body: JSON.stringify(body) });
+  assert.equal((await post('/prepare', { action: 'reboot' }, { ...actionHeaders, 'tailscale-user-login': 'intruder@example.test' })).status, 401);
+  assert.equal((await post('/prepare', { action: 'reboot' }, { ...actionHeaders, Origin: 'https://evil.example' })).status, 403);
+  assert.equal((await post('/prepare', { action: 'reboot' })).status, 503);
+  rows.push({ ...sample, receivedAt: new Date() });
+  assert.equal((await post('/prepare', { action: 'shell' })).status, 400);
+  const prepared = await (await post('/prepare', { action: 'reboot' })).json();
+  const confirmation = { action: 'reboot', challenge: prepared.challenge, confirmation: 'Desktop', acknowledged: true };
+  assert.equal((await post('', { ...confirmation, action: 'poweroff' })).status, 409);
+  assert.equal((await post('', { ...confirmation, confirmation: 'Laptop' })).status, 400);
+  assert.equal((await post('', { ...confirmation, acknowledged: false })).status, 400);
+  assert.equal((await post('', confirmation)).status, 202);
+  assert.equal((await post('', confirmation)).status, 409);
+  assert.equal(mock.calls.filter(call => call.operation === 'execute').length, 1);
+  assert.equal((await request('/api/devices/test-desktop/actions/' + 'a'.repeat(32), { headers })).status, 200);
+  assert.equal((await request('/api/devices/test-laptop/actions/' + 'a'.repeat(32), { headers })).status, 404);
+  assert.equal((await request('/api/devices/test-desktop/actions', { headers })).status, 404);
+});
+test('an expired action confirmation cannot execute', async t => {
+  const mock = mockControls(), { request, rows } = await fixture(t, mock); rows.push({ ...sample, receivedAt: new Date() });
+  const post = (suffix, body) => request('/api/devices/test-desktop/actions' + suffix, { method: 'POST', headers: actionHeaders, body: JSON.stringify(body) });
+  const { challenge } = await (await post('/prepare', { action: 'lock' })).json();
+  const original = Date.now; Date.now = () => original() + 61000;
+  try { assert.equal((await post('', { action: 'lock', challenge, confirmation: 'Desktop', acknowledged: true })).status, 409); }
+  finally { Date.now = original; }
+  assert.equal(mock.calls.filter(call => call.operation === 'execute').length, 0);
+});
+test('lost action responses consume the challenge and cannot be retried automatically', async t => {
+  let attempts = 0; const mock = mockControls();
+  const transport = async (...args) => { if (args[1].operation === 'execute') { attempts++; throw new Error('Connection lost'); } return mock.controlTransport(...args); };
+  const { request, rows } = await fixture(t, { controlTransport: transport }); rows.push({ ...sample, receivedAt: new Date() });
+  const post = (suffix, body) => request('/api/devices/test-desktop/actions' + suffix, { method: 'POST', headers: actionHeaders, body: JSON.stringify(body) });
+  const { challenge } = await (await post('/prepare', { action: 'poweroff' })).json();
+  const body = { action: 'poweroff', challenge, confirmation: 'Desktop', acknowledged: true };
+  assert.equal((await post('', body)).status, 503); assert.equal((await post('', body)).status, 409); assert.equal(attempts, 1);
+});
+test('measured power and capability metadata survive schema validation; enrollment includes helper modules', async t => {
+  const { request, rows } = await fixture(t);
+  const metric = { watts: 21.2, source: 'CPU package', scope: 'package', sampledAt: new Date().toISOString() };
+  const body = { ...sample, power: { cpu: metric, gpu: { ...metric, watts: null, scope: 'board' }, system: { ...metric, watts: null, scope: 'unavailable' } }, controls: { lock: { available: true, reason: '' }, reboot: { available: false, reason: 'Permissions' }, poweroff: { available: false, reason: 'Permissions' } } };
+  const response = await request('/api/ingest', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer first-agent-key' }, body: JSON.stringify(body) });
+  assert.equal(response.status, 202); assert.equal(rows[0].power.cpu.watts, 21.2); assert.equal(rows[0].power.system.watts, null);
+  const zip = unzipSync(new Uint8Array(await (await request('/api/devices/test-laptop/enrollment', { headers })).arrayBuffer()));
+  for (const name of ['relay_power.py', 'relay_controls.py', 'power_service.py', 'install-device-access.sh']) assert.ok(zip[name]);
+});

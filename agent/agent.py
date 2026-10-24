@@ -16,6 +16,9 @@ import time
 import urllib.error
 import urllib.request
 
+from relay_power import collect_power
+from relay_controls import capabilities, handle as control_request
+
 
 def text(path, default=''):
     try:
@@ -107,12 +110,13 @@ class Sampler:
                 return direct / 1e6 if direct is not None else charge * nominal / 1e6 if charge is not None else None
             full, design, current = energy('full'), energy('full_design'), energy('now')
             power = number(text(bat / 'power_now'))
-            power = power / 1e6 if power is not None else (number(text(bat / 'current_now')) or 0) * v / 1e6
+            current_amp = number(text(bat / 'current_now'))
+            power = abs(power) / 1e6 if power is not None else abs(current_amp) * v / 1e6 if current_amp is not None and v else None
             state = text(bat / 'status')
-            return {'percent': number(text(bat / 'capacity')), 'status': state, 'powerW': round(power, 2),
+            return {'percent': number(text(bat / 'capacity')), 'status': state, 'powerW': round(power, 2) if power is not None else None,
                     'fullWh': full, 'designWh': design, 'energyWh': current,
                     'healthPercent': round(full / design * 100, 1) if full and design else None,
-                    'remainingHours': round(current / power, 2) if state == 'Discharging' and current and power > 0.5 else None}
+                    'remainingHours': round(current / power, 2) if state == 'Discharging' and current and power is not None and power > 0.5 else None}
         return None
 
     def gpu(self, now):
@@ -199,12 +203,14 @@ class Sampler:
         except (OSError, subprocess.SubprocessError):
             profile = 'unknown'
         uptime = number(text('/proc/uptime').split(' ')[0]) or 0
+        battery, gpu = self.battery(), self.gpu(now)
         return {'deviceId': self.config['device_id'], 'sampledAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 'hostname': os.uname().nodename, 'os': self.os_name, 'cpuName': self.cpu_name, 'cpuCores': os.cpu_count() or 1,
                 'cpuPercent': round(percent, 1), 'temperatureC': temp, 'temperatureSource': temp_source,
                 'memoryTotalBytes': total_mem, 'memoryUsedBytes': used_mem,
                 'diskTotalBytes': disk.total, 'diskUsedBytes': disk.used, 'diskFreeBytes': disk.free,
-                'uptimeSeconds': uptime, 'powerProfile': profile, 'battery': self.battery(), 'gpu': self.gpu(now),
+                'uptimeSeconds': uptime, 'powerProfile': profile, 'battery': battery, 'gpu': gpu,
+                'power': collect_power(self.config, battery, gpu), 'controls': capabilities(),
                 'network': {'rxBytesPerSecond': round(rates[0]), 'txBytesPerSecond': round(rates[1])},
                 'processCount': len(processes), 'processes': processes[:250]}
 
@@ -280,9 +286,19 @@ def file_request(config, request, output=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
-    parser.add_argument('mode', choices=['run', 'snapshot', 'files'], default='run', nargs='?')
+    parser.add_argument('mode', choices=['run', 'snapshot', 'files', 'control'], default='run', nargs='?')
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text())
+    if args.mode == 'control':
+        try:
+            raw = sys.stdin.buffer.read(16385)
+            if len(raw) > 16384: raise ValueError('Request too large.')
+            request = json.loads(raw)
+            if not isinstance(request, dict): raise ValueError('Invalid request.')
+            print(json.dumps(control_request(request)))
+        except (OSError, ValueError, TypeError):
+            print(json.dumps({'error': 'Device control is unavailable or the request is invalid.'}))
+        return
     if args.mode == 'files':
         try:
             raw = sys.stdin.buffer.read(16385)

@@ -24,7 +24,7 @@ export class MongoStore {
   async history(deviceId) {
     return this.db.collection('history').find({ deviceId, receivedAt: { $gte: new Date(Date.now() - 3600000) } },
       { projection: { _id: 0, receivedAt: 1, cpuPercent: 1, temperatureC: 1, temperatureSource: 1,
-        'gpu.temperatureC': 1, 'gpu.sampledAt': 1, memoryUsedBytes: 1, memoryTotalBytes: 1, battery: 1 } })
+        power: 1, 'gpu.temperatureC': 1, 'gpu.sampledAt': 1, memoryUsedBytes: 1, memoryTotalBytes: 1, battery: 1 } })
       .sort({ receivedAt: -1 }).limit(120).toArray().then(rows => rows.reverse());
   }
   async close() { await this.client.close(); }

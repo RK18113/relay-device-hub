@@ -38,7 +38,8 @@ if not configuration.get('nvidia_monitor'):
                 break
         except OSError:
             pass
-shutil.copy2(agent_source, app_dir / 'agent.py')
+for filename in ['agent.py', 'relay_power.py', 'relay_controls.py']:
+    shutil.copy2(agent_source.parent / filename, app_dir / filename)
 (app_dir / 'agent.py').chmod(0o755)
 target = config_dir / 'agent.json'
 target.write_text(json.dumps(configuration, indent=2) + '\n')

@@ -1,4 +1,4 @@
-const CACHE = 'relay-shell-v3';
+const CACHE = 'relay-shell-v4';
 const PRECACHE = ['/', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(PRECACHE)));

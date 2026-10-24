@@ -2,6 +2,9 @@ import { z } from 'zod';
 const numeric = z.number().finite().nonnegative();
 const temperatureNumber = z.number().finite().min(-30).max(150).nullable().optional();
 const optionalNumber = z.number().finite().nullable().optional();
+const powerMetric = z.object({ watts: numeric.max(100000).nullable(), source: z.string().max(150),
+  scope: z.enum(['package', 'board', 'battery', 'wall', 'unavailable']), sampledAt: z.string().datetime({ offset: true }).nullable() });
+const capability = z.object({ available: z.boolean(), reason: z.string().max(200) });
 export const snapshotSchema = z.object({
   deviceId: z.string().regex(/^[a-z][a-z0-9-]{0,40}$/),
   sampledAt: z.string().datetime({ offset: true }),
@@ -17,6 +20,8 @@ export const snapshotSchema = z.object({
     temperatureSource: z.string().max(150).nullable().optional(),
     powerLimitW: optionalNumber, memoryUsedMb: optionalNumber, memoryTotalMb: optionalNumber,
     sampledAt: z.string().max(60).optional() }).nullable(),
+  power: z.object({ cpu: powerMetric, gpu: powerMetric, system: powerMetric }).optional(),
+  controls: z.object({ lock: capability, reboot: capability, poweroff: capability }).optional(),
   network: z.object({ rxBytesPerSecond: numeric, txBytesPerSecond: numeric }),
   processCount: numeric.max(100000),
   processes: z.array(z.object({ pid: z.number().int().positive(), name: z.string().max(120), user: z.string().max(80),

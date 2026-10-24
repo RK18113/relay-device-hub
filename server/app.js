@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 import { zipSync, strToU8 } from 'fflate';
 import { z } from 'zod';
 import { snapshotSchema } from './schema.js';
+import { controlDevice } from './controls.js';
 import { readListing, streamDownload } from './files.js';
 
 const equal = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -15,10 +16,10 @@ export function publicDevice(device, snapshot) {
   const { token, address, sshUser, agentPath, agentConfig, local, ...metadata } = device;
   const onlineWindow = Math.max(90000, (device.intervalSeconds || 30) * 3000);
   return { ...metadata, status: age < onlineWindow ? 'online' : age < Math.max(300000, onlineWindow * 2) ? 'stale' : receivedAt ? 'offline' : 'pending',
-    receivedAt: receivedAt || null, snapshot: snapshot ? Object.fromEntries(Object.entries(snapshot).filter(([k]) => !['_id', 'processes'].includes(k))) : null };
+    hostsRelay: Boolean(device.local), receivedAt: receivedAt || null, snapshot: snapshot ? Object.fromEntries(Object.entries(snapshot).filter(([k]) => !['_id', 'processes'].includes(k))) : null };
 }
 
-export function createApp({ config, store, localPreview = false, distDirectory, saveConfig, sourceDirectory }) {
+export function createApp({ config, store, localPreview = false, distDirectory, saveConfig, sourceDirectory, controlTransport = controlDevice }) {
   const app = express();
   app.disable('x-powered-by');
   app.use(helmet({ contentSecurityPolicy: { directives: { 'img-src': ["'self'", 'data:'], 'connect-src': ["'self'"], 'object-src': ["'none'"], 'frame-ancestors': ["'none'"] } } }));
@@ -88,10 +89,12 @@ export function createApp({ config, store, localPreview = false, distDirectory, 
     if (!device || !sourceDirectory) return res.status(404).json({ error: 'Device not found.' });
     const agentConfig = { device_id: device.id, server_url: config.publicUrl, token: device.token,
       interval_seconds: device.intervalSeconds || 30, nvidia_monitor: device.nvidiaMonitor || false };
-    const [agent, installer] = await Promise.all([fs.readFile(path.join(sourceDirectory, 'agent/agent.py')), fs.readFile(path.join(sourceDirectory, 'scripts/install-agent.py'))]);
-    const archive = zipSync({ 'agent.py': new Uint8Array(agent), 'install-agent.py': new Uint8Array(installer),
+    const files = ['agent/agent.py', 'agent/relay_power.py', 'agent/relay_controls.py', 'agent/power_service.py',
+      'scripts/install-agent.py', 'scripts/install-device-access.sh'];
+    const archiveFiles = Object.fromEntries(await Promise.all(files.map(async filename => [path.basename(filename), new Uint8Array(await fs.readFile(path.join(sourceDirectory, filename)))])));
+    const archive = zipSync({ ...archiveFiles,
       'device.json': strToU8(JSON.stringify(agentConfig, null, 2)),
-      'README.txt': strToU8('On the Linux device, extract this folder and run:\npython3 install-agent.py --config device.json\n\nThe configuration contains a private agent key. Keep it on your own device.\n') });
+      'README.txt': strToU8('On the Linux device, extract this folder and run:\npython3 install-agent.py --config device.json\n\nOptional CPU power sampling and reboot/shutdown permissions:\nsudo bash install-device-access.sh\n\nThe configuration contains a private agent key. Keep it on your own device.\n') });
     res.setHeader('Content-Type', 'application/zip');
     res.attachment(`relay-${device.id}.zip`).send(Buffer.from(archive));
   });
@@ -103,6 +106,67 @@ export function createApp({ config, store, localPreview = false, distDirectory, 
   app.get('/api/devices/:id/history', async (req, res) => {
     if (!config.devices.some(device => device.id === req.params.id)) return res.status(404).json({ error: 'Device not found.' });
     res.json({ points: await store.history(req.params.id) });
+  });
+  const challenges = new Map(), jobs = new Map();
+  const actionSchema = z.enum(['lock', 'reboot', 'poweroff']);
+  const ownerOrigin = (req, res, next) => {
+    const origin = req.get('origin');
+    const expected = localPreview ? `http://${req.get('host')}` : config.publicUrl && new URL(config.publicUrl).origin;
+    if (!origin || origin !== expected) return res.status(403).json({ error: 'Use this workspace to request device actions.' });
+    next();
+  };
+  async function actionableDevice(req, res, next) {
+    const device = config.devices.find(item => item.id === req.params.id);
+    if (!device) return res.status(404).json({ error: 'Device not found.' });
+    if (!device.local && (!device.address || !device.sshUser)) return res.status(503).json({ error: 'Configure Tailscale SSH for device controls.' });
+    const row = (await store.devices()).find(item => item.deviceId === device.id);
+    if (!row || publicDevice(device, row).status !== 'online') return res.status(503).json({ error: 'This device has no recent report. Wake it before requesting an action.' });
+    req.relayDevice = device; next();
+  }
+  function prune() {
+    for (const [key, value] of challenges) if (value.expires < Date.now()) challenges.delete(key);
+    for (const [key, value] of jobs) if (value.expires < Date.now()) jobs.delete(key);
+  }
+  app.post('/api/devices/:id/actions/prepare', ownerOrigin, actionableDevice, async (req, res) => {
+    prune();
+    const parsed = actionSchema.safeParse(req.body.action);
+    if (!parsed.success) return res.status(400).json({ error: 'Choose lock, reboot or poweroff.' });
+    if (challenges.size >= 100) return res.status(429).json({ error: 'Too many pending confirmations. Please wait a minute.' });
+    try {
+      const result = await controlTransport(req.relayDevice, { operation: 'capabilities' });
+      if (result.capabilities?.[parsed.data]?.available !== true) return res.status(409).json({ error: result.capabilities?.[parsed.data]?.reason || 'This device action is unavailable.' });
+      const challenge = randomBytes(32).toString('hex');
+      challenges.set(challenge, { device: req.relayDevice.id, action: parsed.data, user: req.relayUser, expires: Date.now() + 60000 });
+      res.json({ challenge, expiresInSeconds: 60, hostsRelay: Boolean(req.relayDevice.local) });
+    } catch (error) { res.status(503).json({ error: error.message }); }
+  });
+  app.post('/api/devices/:id/actions', ownerOrigin, actionableDevice, async (req, res) => {
+    prune();
+    const parsed = z.object({ action: actionSchema, challenge: z.string().regex(/^[a-f0-9]{64}$/),
+      confirmation: z.string().max(60), acknowledged: z.literal(true) }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Confirm the device action before continuing.' });
+    const value = parsed.data, pending = challenges.get(value.challenge);
+    if (!pending || pending.device !== req.relayDevice.id || pending.action !== value.action || pending.user !== req.relayUser)
+      return res.status(409).json({ error: 'Confirmation expired or already used. Open the confirmation again.' });
+    if (value.confirmation !== req.relayDevice.name) return res.status(400).json({ error: 'The device name does not match.' });
+    // Consume before contacting the device: a lost response must never execute twice.
+    challenges.delete(value.challenge);
+    try {
+      const result = await controlTransport(req.relayDevice, { operation: 'execute', action: value.action });
+      if (!/^[a-f0-9]{32}$/.test(result.jobId || '') || result.status !== 'scheduled') throw new Error('The device did not schedule this action.');
+      jobs.set(result.jobId, { device: req.relayDevice.id, user: req.relayUser, expires: Date.now() + 3600000 });
+      res.status(202).json({ jobId: result.jobId, status: 'scheduled', delaySeconds: 3 });
+    } catch (error) { res.status(503).json({ error: error.message }); }
+  });
+  app.get('/api/devices/:id/actions/:job', async (req, res) => {
+    prune();
+    const job = jobs.get(req.params.job), device = config.devices.find(item => item.id === req.params.id);
+    if (!job || !device || job.device !== device.id || job.user !== req.relayUser) return res.status(404).json({ error: 'Action not found.' });
+    try {
+      const result = await controlTransport(device, { operation: 'status', jobId: req.params.job });
+      const status = ['scheduled', 'requested', 'failed', 'unknown'].includes(result.status) ? result.status : 'unknown';
+      res.json({ status, message: typeof result.message === 'string' ? result.message.slice(0, 300) : 'No action status available.' });
+    } catch { res.status(503).json({ error: 'Device disconnected. The action may have run; check its state before retrying.' }); }
   });
   async function fileDevice(req, res, next) {
     const device = config.devices.find(item => item.id === req.params.id);
